@@ -184,11 +184,11 @@ Start a run of a workflow.
   "workflow_id": "wf_01",
   "input": {
     "pr_number": 42,
-    "repo": "Ghost-Frame/soma"
+    "repo": "octo-org/octo-repo"
   },
   "metadata": {
     "triggered_by": "webhook",
-    "user": "zanfiel"
+    "user": "octocat"
   }
 }
 ```
@@ -199,7 +199,7 @@ Start a run of a workflow.
   "id": "run_01",
   "workflow_id": "wf_01",
   "status": "running",
-  "input": { "pr_number": 42, "repo": "Ghost-Frame/soma" },
+  "input": { "pr_number": 42, "repo": "octo-org/octo-repo" },
   "metadata": { "triggered_by": "webhook" },
   "current_step": 0,
   "created_at": "2026-03-22T12:00:00Z"
@@ -442,3 +442,17 @@ Returns aggregate counts.
   "runs_failed": 9
 }
 ```
+
+---
+
+## Where Loom Fits
+
+Loom is one piece of a larger agent infrastructure. Sister services:
+
+- [axon](https://github.com/Ghost-Frame/axon) -- pub/sub event bus
+- [broca](https://github.com/Ghost-Frame/broca) -- action log and natural language narrator
+- [chiasm](https://github.com/Ghost-Frame/chiasm) -- task coordination dashboard
+- [soma](https://github.com/Ghost-Frame/soma) -- agent registry and heartbeats
+- [thymus](https://github.com/Ghost-Frame/thymus) -- output evaluation and quality scoring
+
+Loom runs standalone -- agents poll for steps and report completion -- and integrates with the rest of the stack via Axon events.
