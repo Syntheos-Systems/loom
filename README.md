@@ -1,6 +1,6 @@
 # Loom
 
-Loom is a workflow orchestration engine for multi-agent pipelines. Define workflows as ordered sequences of steps, each assigned to an agent and action. Start runs against those workflows, then advance them step by step as agents complete their work. Loom tracks run state, step outputs, and logs throughout execution.
+Loom runs multi-agent workflows. You define a workflow as a set of named steps with dependencies, kick off a run, and Loom advances the run by starting ready steps and waiting for their results. Some step types execute themselves (webhooks, LLM calls, data transforms). Others wait for an external agent to call back with output. Loom tracks state, retries failed steps, and emits events to Axon as runs progress.
 
 - **Port:** 4700
 - **Stack:** Node 22, libsql (SQLite-compatible embedded database)
@@ -10,11 +10,12 @@ Loom is a workflow orchestration engine for multi-agent pipelines. Define workfl
 
 ## What It Does
 
-- Stores reusable workflow definitions with ordered, named steps
-- Creates run instances from workflow definitions, carrying input data and metadata
-- Tracks run and step state (pending, running, completed, failed, cancelled)
-- Advances runs step by step as agents signal completion or failure
-- Stores per-step outputs and per-run logs for full execution history
+- Stores reusable workflow definitions with typed steps and dependency graphs
+- Creates runs from workflows, carrying input data through every step
+- Advances runs automatically as steps complete or fail
+- Auto-executes `action`-with-url (webhook), `llm`, and `transform` step types
+- Retries failed steps up to `max_retries`, then fails the run
+- Records per-step output, per-run logs, and emits events to Axon
 
 ---
 
@@ -30,7 +31,7 @@ docker run -d \
   ghcr.io/ghost-frame/loom:latest
 ```
 
-Without `LOOM_AUTH=disabled`, all write endpoints require `Authorization: Bearer <LOOM_API_KEY>`.
+Without `LOOM_AUTH=disabled`, every endpoint except `/health` requires `Authorization: Bearer <LOOM_API_KEY>`.
 
 ---
 
@@ -39,29 +40,36 @@ Without `LOOM_AUTH=disabled`, all write endpoints require `Authorization: Bearer
 | Variable            | Default     | Description                                                        |
 |---------------------|-------------|--------------------------------------------------------------------|
 | `PORT`              | `4700`      | Port to listen on                                                  |
+| `HOST`              | `0.0.0.0`   | Bind address                                                       |
 | `DB_PATH`           | `loom.db`   | Path to the libsql database file                                   |
 | `LOOM_API_KEY`      | (none)      | Bearer token required for authenticated requests                   |
 | `LOOM_AUTH`         | (required)  | Set to `disabled` to skip auth entirely (development only)         |
-| `CORS_ALLOW_ORIGIN` | `*`         | Value for the `Access-Control-Allow-Origin` response header        |
+| `CORS_ALLOW_ORIGIN` | (none)      | Value for the `Access-Control-Allow-Origin` response header        |
+| `BODY_MAX_BYTES`    | `65536`     | Maximum request body size                                          |
+| `AXON_URL`          | `http://localhost:4600` | Axon endpoint to publish lifecycle events to             |
+| `AXON_API_KEY`      | (none)      | Bearer token for Axon publishes                                    |
 
 ---
 
 ## Concepts
 
-- **Workflow** - a reusable template defining a sequence of steps
-- **Step** (in a workflow) - a named unit of work assigned to an agent and action, with optional config
-- **Run** - a single execution instance of a workflow, carrying input data
-- **Step** (in a run) - a concrete instance of a workflow step, with its own state and output
-- **Log** - a timestamped message attached to a run or step
+- **Workflow** -- a named template with an array of steps
+- **Step (definition)** -- `{ name, type, config, depends_on, max_retries, timeout_ms }`
+- **Run** -- a single execution of a workflow, carrying `input` through to `output`
+- **Step (instance)** -- a concrete step record on a specific run, with its own status and output
+- **Log** -- a timestamped message attached to a run, optionally scoped to one step
 
-A typical flow:
+Step types Loom understands:
 
-1. `POST /workflows` to define the pipeline once
-2. `POST /runs` to start a run with input data
-3. The first step is set to `running`; the assigned agent picks it up
-4. Agent calls `POST /steps/:id/complete` with its output
-5. `POST /runs/:id/advance` moves to the next step
-6. Repeat until all steps are complete
+| Type        | Behavior                                                                 |
+|-------------|--------------------------------------------------------------------------|
+| `action`    | If `config.url` is set, Loom POSTs to that URL and completes the step with the response. Otherwise the step waits for an external agent to call `/steps/:id/complete`. |
+| `webhook`   | Same external-callback semantics as a plain `action` without a URL.      |
+| `llm`       | Loom calls `config.url` with the configured prompt template. Supports OpenAI-compatible endpoints and a minimal `{system, prompt, model}` shape. JSON-schema validated output is supported via `config.schema`. |
+| `transform` | Reshapes data from prior step outputs into this step's output using `config.mapping`. Supports `{{var}}` interpolation and dot-path resolution. |
+| `decision`, `parallel`, `wait` | Reserved types. Wait for an external agent to complete the step. |
+
+Runs advance automatically. When you create a run, Loom starts the first ready step. When a step completes (via `/steps/:id/complete` or via auto-execution), Loom evaluates dependencies, starts every newly ready step, and finishes the run once all steps land in `completed` or `skipped`. When a step exhausts its retries, Loom fails the run and skips remaining pending steps.
 
 ---
 
@@ -71,10 +79,17 @@ A typical flow:
 
 #### `GET /health`
 
-Returns service status.
+Always open. Returns version and live counts.
 
 ```json
-{ "status": "ok" }
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "workflows": 5,
+  "runs": 142,
+  "active_runs": 3,
+  "steps": 426
+}
 ```
 
 ---
@@ -88,87 +103,57 @@ Create a workflow.
 **Request**
 ```json
 {
-  "name": "PR Review Pipeline",
+  "name": "pr-review",
   "description": "Fetch PR diff, review it, post comment",
   "steps": [
     {
-      "name": "fetch-diff",
-      "agent": "github-agent",
-      "action": "fetch_pr_diff",
-      "config": { "timeout": 30 }
+      "name": "fetch",
+      "type": "action",
+      "config": { "url": "https://example.com/github/fetch-diff" }
     },
     {
-      "name": "review-code",
-      "agent": "code-reviewer",
-      "action": "review_diff",
-      "config": { "model": "claude-sonnet-4-6" }
+      "name": "review",
+      "type": "llm",
+      "config": {
+        "url": "http://localhost:4200/llm",
+        "model": "claude-sonnet-4-6",
+        "prompt": "Review this diff:\n{{fetch.diff}}"
+      },
+      "depends_on": ["fetch"]
     },
     {
-      "name": "post-comment",
-      "agent": "github-agent",
-      "action": "post_pr_comment",
-      "config": {}
+      "name": "post",
+      "type": "action",
+      "config": { "url": "https://example.com/github/post-comment" },
+      "depends_on": ["review"]
     }
   ]
 }
 ```
 
-**Response** `201`
-```json
-{
-  "id": "wf_01",
-  "name": "PR Review Pipeline",
-  "description": "Fetch PR diff, review it, post comment",
-  "steps": [
-    { "id": "wfs_01", "name": "fetch-diff", "agent": "github-agent", "action": "fetch_pr_diff", "order": 0 },
-    { "id": "wfs_02", "name": "review-code", "agent": "code-reviewer", "action": "review_diff", "order": 1 },
-    { "id": "wfs_03", "name": "post-comment", "agent": "github-agent", "action": "post_pr_comment", "order": 2 }
-  ],
-  "created_at": "2026-03-22T12:00:00Z"
-}
-```
+Step fields: `name`, `type`, `config` are required. `depends_on` defaults to `[]`. `max_retries` defaults to `3`. `timeout_ms` defaults to `30000`.
+
+**Response** `201` -- the stored workflow object.
+
+Returns `409` if the workflow name already exists.
 
 ---
 
 #### `GET /workflows`
 
-List all workflows.
-
-**Response** `200`
-```json
-[
-  { "id": "wf_01", "name": "PR Review Pipeline", "step_count": 3, "created_at": "2026-03-22T12:00:00Z" }
-]
-```
-
----
+List every workflow, ordered by name.
 
 #### `GET /workflows/:id`
 
-Get a workflow with full step definitions.
-
-**Response** `200` - full workflow object as shown in `POST /workflows`
-
----
+Get one workflow.
 
 #### `PATCH /workflows/:id`
 
-Update a workflow's name, description, or steps.
-
-**Request** - any subset of workflow fields
-
-**Response** `200` - updated workflow object
-
----
+Update `description` and/or `steps`. Other fields are ignored.
 
 #### `DELETE /workflows/:id`
 
-Delete a workflow definition. Does not cancel active runs.
-
-**Response** `200`
-```json
-{ "ok": true }
-```
+Delete a workflow. Existing runs and their steps stay intact.
 
 ---
 
@@ -176,56 +161,73 @@ Delete a workflow definition. Does not cancel active runs.
 
 #### `POST /runs`
 
-Start a run of a workflow.
+Start a run. You can target the workflow by ID or by name.
 
 **Request**
 ```json
 {
-  "workflow_id": "wf_01",
-  "input": {
-    "pr_number": 42,
-    "repo": "octo-org/octo-repo"
-  },
-  "metadata": {
-    "triggered_by": "webhook",
-    "user": "octocat"
-  }
+  "workflow_id": 1,
+  "input": { "pr_number": 42, "repo": "octo-org/octo-repo" }
 }
 ```
 
-**Response** `201`
+Or:
 ```json
 {
-  "id": "run_01",
-  "workflow_id": "wf_01",
-  "status": "running",
-  "input": { "pr_number": 42, "repo": "octo-org/octo-repo" },
-  "metadata": { "triggered_by": "webhook" },
-  "current_step": 0,
-  "created_at": "2026-03-22T12:00:00Z"
+  "workflow_name": "pr-review",
+  "input": { "pr_number": 42 }
 }
 ```
 
-The first step is automatically set to `running` status when the run is created.
+**Response** `201` -- the run object, already advanced to whatever steps were ready at creation. Self-executing step types may already have results by the time the response returns.
 
 ---
 
 #### `GET /runs`
 
-List runs. Filter by workflow or status.
+List runs.
 
 **Query params**
-- `workflow_id` - filter by workflow ID
-- `status` - filter by run status (`running`, `completed`, `failed`, `cancelled`)
+- `workflow_id` -- filter by workflow
+- `status` -- filter by run status (`pending`, `running`, `paused`, `completed`, `failed`, `cancelled`)
+- `limit` -- default `50`, max `500`
 
-**Response** `200`
+---
+
+#### `GET /runs/:id`
+
+Get one run. Returns `input`, `output`, `error`, status timestamps, and the workflow ID.
+
+---
+
+#### `POST /runs/:id/cancel`
+
+Cancel a run. Marks any pending or running steps as `skipped` and sets the run to `cancelled`. Does nothing if the run is already terminal.
+
+---
+
+#### `GET /runs/:id/steps`
+
+List every step instance for a run, ordered by creation.
+
 ```json
 [
   {
-    "id": "run_01",
-    "workflow_id": "wf_01",
-    "status": "running",
-    "current_step": 0,
+    "id": 17,
+    "run_id": 4,
+    "name": "fetch",
+    "type": "action",
+    "config": { "url": "https://example.com/github/fetch-diff" },
+    "status": "completed",
+    "input": { "pr_number": 42 },
+    "output": { "diff": "..." },
+    "error": null,
+    "depends_on": [],
+    "retry_count": 0,
+    "max_retries": 3,
+    "timeout_ms": 30000,
+    "started_at": "2026-03-22T12:00:01Z",
+    "completed_at": "2026-03-22T12:00:04Z",
     "created_at": "2026-03-22T12:00:00Z"
   }
 ]
@@ -233,195 +235,48 @@ List runs. Filter by workflow or status.
 
 ---
 
-#### `GET /runs/:id`
+#### `GET /runs/:id/logs`
 
-Get a run with all its step instances and current state.
-
-**Response** `200`
-```json
-{
-  "id": "run_01",
-  "workflow_id": "wf_01",
-  "status": "running",
-  "input": { "pr_number": 42 },
-  "current_step": 0,
-  "steps": [
-    {
-      "id": "rs_01",
-      "name": "fetch-diff",
-      "agent": "github-agent",
-      "action": "fetch_pr_diff",
-      "status": "running",
-      "output": null,
-      "started_at": "2026-03-22T12:00:01Z",
-      "completed_at": null
-    },
-    {
-      "id": "rs_02",
-      "name": "review-code",
-      "agent": "code-reviewer",
-      "action": "review_diff",
-      "status": "pending",
-      "output": null
-    }
-  ],
-  "created_at": "2026-03-22T12:00:00Z"
-}
-```
-
----
-
-#### `POST /runs/:id/cancel`
-
-Cancel an active run. Sets run status to `cancelled` and any non-completed steps to `cancelled`.
-
-**Response** `200`
-```json
-{ "ok": true }
-```
-
----
-
-#### `POST /runs/:id/advance`
-
-Advance the run to the next step. Sets the next step's status to `running`. If there are no more steps, sets run status to `completed`.
-
-**Response** `200`
-```json
-{
-  "ok": true,
-  "run_status": "running",
-  "current_step": 1,
-  "next_step": {
-    "id": "rs_02",
-    "name": "review-code",
-    "agent": "code-reviewer",
-    "action": "review_diff"
-  }
-}
-```
-
-When the last step completes and advance is called:
-```json
-{ "ok": true, "run_status": "completed", "current_step": null, "next_step": null }
-```
-
----
-
-### Steps
-
-#### `GET /steps`
-
-List step instances for a run. Requires `?run_id=` query param.
+Get logs for a run.
 
 **Query params**
-- `run_id` (required) - the run to list steps for
-
-**Response** `200` - array of step objects (see `GET /runs/:id`)
-
----
-
-#### `GET /steps/:id`
-
-Get a single step instance.
-
-**Response** `200` - step object
+- `step_id` -- restrict to one step
+- `level` -- filter by level (`info`, `warn`, `error`, etc.)
+- `limit` -- default `100`, max `1000`
 
 ---
+
+### Step Callbacks
+
+Use these from your agent when a step's type is `action` (without `config.url`), `webhook`, `decision`, `parallel`, or `wait`.
 
 #### `POST /steps/:id/complete`
 
-Mark a step as completed and store its output.
+Mark a step as completed and supply its output. The body is treated as the output; if the body has a top-level `output` field, that field is used instead. Completing a step automatically advances the run.
 
 **Request**
 ```json
 {
-  "output": {
-    "diff": "--- a/server.ts\n+++ b/server.ts\n..."
-  },
-  "metadata": {
-    "duration_ms": 843
-  }
+  "output": { "diff": "--- a/server.ts\n+++ b/server.ts\n..." }
 }
 ```
 
-**Response** `200`
+Or, equivalently:
 ```json
-{
-  "ok": true,
-  "step_id": "rs_01",
-  "status": "completed",
-  "completed_at": "2026-03-22T12:00:05Z"
-}
+{ "diff": "--- a/server.ts\n+++ b/server.ts\n..." }
 ```
+
+**Response** `200` -- the updated step.
 
 ---
 
 #### `POST /steps/:id/fail`
 
-Mark a step as failed and store the error.
+Report failure. If the step has retries remaining, it goes back to `pending` with `retry_count` incremented and the run re-advances to pick it up. If retries are exhausted, the step is marked `failed`, the run is marked `failed`, and remaining pending steps are skipped.
 
 **Request**
 ```json
-{
-  "error": "GitHub API returned 404: PR not found"
-}
-```
-
-**Response** `200`
-```json
-{
-  "ok": true,
-  "step_id": "rs_01",
-  "status": "failed"
-}
-```
-
-When a step fails, the run status is also set to `failed`.
-
----
-
-### Logs
-
-#### `GET /runs/:id/logs`
-
-Get all logs for a run.
-
-**Response** `200`
-```json
-[
-  {
-    "id": "log_01",
-    "run_id": "run_01",
-    "step_id": "rs_01",
-    "level": "info",
-    "message": "Fetching diff for PR #42",
-    "created_at": "2026-03-22T12:00:02Z"
-  }
-]
-```
-
----
-
-#### `POST /logs`
-
-Add a log entry to a run.
-
-**Request**
-```json
-{
-  "run_id": "run_01",
-  "step_id": "rs_01",
-  "level": "info",
-  "message": "Fetching diff for PR #42"
-}
-```
-
-`step_id` is optional. Accepted levels: `debug`, `info`, `warn`, `error`
-
-**Response** `201`
-```json
-{ "id": "log_01", "ok": true }
+{ "error": "GitHub API returned 404" }
 ```
 
 ---
@@ -430,18 +285,36 @@ Add a log entry to a run.
 
 #### `GET /stats`
 
-Returns aggregate counts.
+Aggregate counts plus a status breakdown.
 
-**Response** `200`
 ```json
 {
   "workflows": 5,
-  "runs_total": 142,
-  "runs_active": 3,
-  "runs_completed": 130,
-  "runs_failed": 9
+  "runs": 142,
+  "active_runs": 3,
+  "steps": 426,
+  "runs_by_status": [
+    { "status": "completed", "count": 130 },
+    { "status": "failed", "count": 9 },
+    { "status": "running", "count": 3 }
+  ]
 }
 ```
+
+---
+
+## Events
+
+Loom publishes lifecycle events to Axon when `AXON_URL` is reachable. All events carry `source: "loom"`.
+
+| Channel  | Type                       | Emitted when                                |
+|----------|----------------------------|---------------------------------------------|
+| `tasks`  | `workflow.run.created`     | A run is created                            |
+| `tasks`  | `workflow.run.completed`   | All steps reach a terminal success state    |
+| `tasks`  | `workflow.run.cancelled`   | A run is cancelled                          |
+| `alerts` | `workflow.run.failed`      | A step exhausts retries and fails the run   |
+
+Loom never blocks on Axon publishes. If Axon is down, events are dropped and the run continues.
 
 ---
 
@@ -455,4 +328,4 @@ Loom is one piece of a larger agent infrastructure. Sister services:
 - [soma](https://github.com/Ghost-Frame/soma) -- agent registry and heartbeats
 - [thymus](https://github.com/Ghost-Frame/thymus) -- output evaluation and quality scoring
 
-Loom runs standalone -- agents poll for steps and report completion -- and integrates with the rest of the stack via Axon events.
+Loom runs standalone. Agents pick up callback-style steps by polling `/runs/:id/steps` and posting back to `/steps/:id/complete`. Wire it into the rest of the stack through Axon for fanout.
