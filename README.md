@@ -4,7 +4,6 @@ Loom runs multi-agent workflows. You define a workflow as a set of named steps w
 
 - **Port:** 4700
 - **Stack:** Node 22, libsql (SQLite-compatible embedded database)
-- **Org:** [Ghost-Frame/loom](https://github.com/Ghost-Frame/loom)
 
 ---
 
